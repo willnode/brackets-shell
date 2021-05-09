@@ -8,7 +8,8 @@
 These functions are executed via gyp-mac-tool when using the Makefile generator.
 """
 
-import errno
+from __future__ import print_function
+
 import fcntl
 import fnmatch
 import glob
@@ -17,7 +18,6 @@ import os
 import plistlib
 import re
 import shutil
-import string
 import struct
 import subprocess
 import sys
@@ -50,6 +50,7 @@ class MacTool(object):
   def ExecCopyBundleResource(self, source, dest, convert_to_binary):
     """Copies a resource file to the bundle/Resources directory, performing any
     necessary compilation on each resource."""
+    convert_to_binary = convert_to_binary == 'True'
     extension = os.path.splitext(source)[1].lower()
     if os.path.isdir(source):
       # Copy tree.
@@ -63,22 +64,14 @@ class MacTool(object):
       return self._CopyXIBFile(source, dest)
     elif extension == '.storyboard':
       return self._CopyXIBFile(source, dest)
-    elif extension == '.strings':
+    elif extension == '.strings' and not convert_to_binary:
       self._CopyStringsFile(source, dest)
     else:
-      # Try to hard-link, but fallback to copy if the hard-link fails due
-      # to cross device link error ([Errno 18] Cross-device link).
-      try:
-        if os.path.isfile(dest):
-          os.unlink(dest)
-        os.link(source, dest)
-      except OSError, e:
-        if e.errno == errno.EXDEV:
-          shutil.copy(source, dest)
-        else:
-          raise
+      if os.path.exists(dest):
+        os.unlink(dest)
+      shutil.copy(source, dest)
 
-    if extension in ('.plist', '.strings') and convert_to_binary == 'True':
+    if convert_to_binary and extension in ('.plist', '.strings'):
       self._ConvertToBinary(dest)
 
   def _CopyXIBFile(self, source, dest):
@@ -113,17 +106,22 @@ class MacTool(object):
 
     ibtool_section_re = re.compile(r'/\*.*\*/')
     ibtool_re = re.compile(r'.*note:.*is clipping its content')
-    ibtoolout = subprocess.Popen(args, stdout=subprocess.PIPE)
+    try:
+      stdout = subprocess.check_output(args)
+    except subprocess.CalledProcessError as e:
+      print(e.output)
+      raise
     current_section_header = None
-    for line in ibtoolout.stdout:
-      if ibtool_section_re.match(line):
-        current_section_header = line
-      elif not ibtool_re.match(line):
+    for line in stdout.splitlines():
+      line_decoded = line.decode('utf-8')
+      if ibtool_section_re.match(line_decoded):
+        current_section_header = line_decoded
+      elif not ibtool_re.match(line_decoded):
         if current_section_header:
-          sys.stdout.write(current_section_header)
+          print(current_section_header)
           current_section_header = None
-        sys.stdout.write(line)
-    return ibtoolout.returncode
+        print(line_decoded)
+    return 0
 
   def _ConvertToBinary(self, dest):
     subprocess.check_call([
@@ -155,15 +153,15 @@ class MacTool(object):
     fp = open(file_name, 'rb')
     try:
       header = fp.read(3)
-    except e:
+    except:
       fp.close()
       return None
     fp.close()
-    if header.startswith("\xFE\xFF"):
+    if header.startswith(b"\xFE\xFF"):
       return "UTF-16"
-    elif header.startswith("\xFF\xFE"):
+    elif header.startswith(b"\xFF\xFE"):
       return "UTF-16"
-    elif header.startswith("\xEF\xBB\xBF"):
+    elif header.startswith(b"\xEF\xBB\xBF"):
       return "UTF-8"
     else:
       return None
@@ -178,18 +176,18 @@ class MacTool(object):
     # Insert synthesized key/value pairs (e.g. BuildMachineOSBuild).
     plist = plistlib.readPlistFromString(lines)
     if keys:
-      plist = dict(plist.items() + json.loads(keys[0]).items())
+      plist.update(json.loads(keys[0]))
     lines = plistlib.writePlistToString(plist)
 
     # Go through all the environment variables and replace them as variables in
     # the file.
-    IDENT_RE = re.compile(r'[/\s]')
+    IDENT_RE = re.compile(r'[_/\s]')
     for key in os.environ:
       if key.startswith('_'):
         continue
       evar = '${%s}' % key
       evalue = os.environ[key]
-      lines = string.replace(lines, evar, evalue)
+      lines = lines.replace(evar, evalue)
 
       # Xcode supports various suffices on environment variables, which are
       # all undocumented. :rfc1034identifier is used in the standard project
@@ -199,11 +197,11 @@ class MacTool(object):
       # in a URL either -- oops, hence :rfc1034identifier was born.
       evar = '${%s:identifier}' % key
       evalue = IDENT_RE.sub('_', os.environ[key])
-      lines = string.replace(lines, evar, evalue)
+      lines = lines.replace(evar, evalue)
 
       evar = '${%s:rfc1034identifier}' % key
       evalue = IDENT_RE.sub('-', os.environ[key])
-      lines = string.replace(lines, evar, evalue)
+      lines = lines.replace(evar, evalue)
 
     # Remove any keys with values that haven't been replaced.
     lines = lines.split('\n')
@@ -273,8 +271,9 @@ class MacTool(object):
     libtoolout = subprocess.Popen(cmd_list, stderr=subprocess.PIPE, env=env)
     _, err = libtoolout.communicate()
     for line in err.splitlines():
-      if not libtool_re.match(line) and not libtool_re5.match(line):
-        print >>sys.stderr, line
+      line_decoded = line.decode('utf-8')
+      if not libtool_re.match(line_decoded) and not libtool_re5.match(line_decoded):
+        print(line_decoded, file=sys.stderr)
     # Unconditionally touch the output .a file on the command line if present
     # and the command succeeded. A bit hacky.
     if not libtoolout.returncode:
@@ -389,7 +388,7 @@ class MacTool(object):
       ])
     if keys:
       keys = json.loads(keys)
-      for key, value in keys.iteritems():
+      for key, value in keys.items():
         arg_name = '--' + key
         if isinstance(value, bool):
           if value:
@@ -414,7 +413,7 @@ class MacTool(object):
       self._MergePlist(merged_plist, plist)
     plistlib.writePlist(merged_plist, output)
 
-  def ExecCodeSignBundle(self, key, entitlements, provisioning):
+  def ExecCodeSignBundle(self, key, entitlements, provisioning, path, preserve):
     """Code sign a bundle.
 
     This function tries to code sign an iOS bundle, following the same
@@ -428,11 +427,14 @@ class MacTool(object):
         provisioning, self._GetCFBundleIdentifier())
     entitlements_path = self._InstallEntitlements(
         entitlements, substitutions, overrides)
-    subprocess.check_call([
-        'codesign', '--force', '--sign', key, '--entitlements',
-        entitlements_path, '--timestamp=none', os.path.join(
-            os.environ['TARGET_BUILD_DIR'],
-            os.environ['FULL_PRODUCT_NAME'])])
+
+    args = ['codesign', '--force', '--sign', key]
+    if preserve == 'True':
+      args.extend(['--deep', '--preserve-metadata=identifier,entitlements'])
+    else:
+      args.extend(['--entitlements', entitlements_path])
+    args.extend(['--timestamp=none', path])
+    subprocess.check_call(args)
 
   def _InstallProvisioningProfile(self, profile, bundle_identifier):
     """Installs embedded.mobileprovision into the bundle.
@@ -481,8 +483,9 @@ class MacTool(object):
     profiles_dir = os.path.join(
         os.environ['HOME'], 'Library', 'MobileDevice', 'Provisioning Profiles')
     if not os.path.isdir(profiles_dir):
-      print >>sys.stderr, (
-          'cannot find mobile provisioning for %s' % bundle_identifier)
+      print((
+          'cannot find mobile provisioning for %s' % bundle_identifier),
+          file=sys.stderr)
       sys.exit(1)
     provisioning_profiles = None
     if profile:
@@ -503,8 +506,9 @@ class MacTool(object):
           valid_provisioning_profiles[app_id_pattern] = (
               profile_path, profile_data, team_identifier)
     if not valid_provisioning_profiles:
-      print >>sys.stderr, (
-          'cannot find mobile provisioning for %s' % bundle_identifier)
+      print((
+          'cannot find mobile provisioning for %s' % bundle_identifier),
+          file=sys.stderr)
       sys.exit(1)
     # If the user has multiple provisioning profiles installed that can be
     # used for ${bundle_identifier}, pick the most specific one (ie. the
@@ -528,7 +532,7 @@ class MacTool(object):
 
   def _MergePlist(self, merged_plist, plist):
     """Merge |plist| into |merged_plist|."""
-    for key, value in plist.iteritems():
+    for key, value in plist.items():
       if isinstance(value, dict):
         merged_value = merged_plist.get(key, {})
         if isinstance(merged_value, dict):
@@ -638,7 +642,7 @@ class MacTool(object):
       the key was not found.
     """
     if isinstance(data, str):
-      for key, value in substitutions.iteritems():
+      for key, value in substitutions.items():
         data = data.replace('$(%s)' % key, value)
       return data
     if isinstance(data, list):
@@ -648,7 +652,7 @@ class MacTool(object):
     return data
 
 def NextGreaterPowerOf2(x):
-  return 2**(x-1).bit_length()
+  return 2**(x).bit_length()
 
 def WriteHmap(output_name, filelist):
   """Generates a header map based on |filelist|.
@@ -668,7 +672,7 @@ def WriteHmap(output_name, filelist):
   count = len(filelist)
   capacity = NextGreaterPowerOf2(count)
   strings_offset = 24 + (12 * capacity)
-  max_value_length = len(max(filelist.items(), key=lambda (k,v):len(v))[1])
+  max_value_length = len(max(filelist.items(), key=lambda t: len(t[1]))[1])
 
   out = open(output_name, "wb")
   out.write(struct.pack('<LHHLLLL', magic, version, _reserved, strings_offset,
